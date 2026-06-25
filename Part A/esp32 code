@@ -1,0 +1,119 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <DHT.h>
+
+// --- Hardware Definitions ---
+#define DHTPIN 4
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+
+// --- Network & Broker Configuration ---
+const char* ssid = "Wokwi-GUEST"; // Wokwi's default simulated WiFi
+const char* password = "";
+
+const char* mqtt_server = "ab971433a78e4306b466dee0dbe85f61.s1.eu.hivemq.cloud"; // REPLACE THIS
+const int mqtt_port = 8883; // Secure port
+const char* mqtt_user = "IFTEKHAR"; // REPLACE THIS
+const char* mqtt_pass = "Iftekhar123"; // REPLACE THIS
+const char* mqtt_topic = "interview/sensor/data";
+
+WiFiClientSecure espClient;
+PubSubClient client(espClient);
+
+// --- State Machine Timers ---
+unsigned long lastSensorReadTime = 0;
+unsigned long lastMQTTReconnectAttempt = 0;
+unsigned long lastWiFiReconnectAttempt = 0;
+const unsigned long sensorInterval = 5000;      // 5 seconds
+const unsigned long reconnectInterval = 5000;   // 5 seconds
+
+void setup() {
+  Serial.begin(115200);
+  dht.begin();
+  
+  // Bypass SSL certificate validation for the Wokwi simulation
+  espClient.setInsecure(); 
+  
+  client.setServer(mqtt_server, mqtt_port);
+  
+  Serial.println("System Booted. Starting non-blocking operations...");
+  WiFi.begin(ssid, password);
+}
+
+// Non-blocking MQTT reconnection function
+boolean reconnectMQTT() {
+  String clientId = "ESP32-Node-";
+  clientId += String(random(0xffff), HEX); // Ensure unique ID
+  
+  Serial.print("Attempting MQTT connection...");
+  if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
+    Serial.println("Connected!");
+    return true;
+  } else {
+    Serial.print("Failed, rc=");
+    Serial.println(client.state());
+    return false;
+  }
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // --- 1. WiFi State Management ---
+  if (WiFi.status() != WL_CONNECTED) {
+    if (currentMillis - lastWiFiReconnectAttempt > reconnectInterval) {
+      lastWiFiReconnectAttempt = currentMillis;
+      Serial.println("WiFi disconnected. Attempting to reconnect...");
+      WiFi.disconnect();
+      WiFi.begin(ssid, password);
+    }
+  } 
+  
+  // --- 2. MQTT State Management ---
+  else { 
+    if (!client.connected()) {
+      if (currentMillis - lastMQTTReconnectAttempt > reconnectInterval) {
+        lastMQTTReconnectAttempt = currentMillis;
+        if (reconnectMQTT()) {
+          lastMQTTReconnectAttempt = 0; 
+        }
+      }
+    } else {
+      // Maintain connection
+      client.loop();
+    }
+  }
+
+  // --- 3. Sensor Reading & Publishing (Only if connected) ---
+  if (client.connected() && (currentMillis - lastSensorReadTime >= sensorInterval)) {
+    lastSensorReadTime = currentMillis;
+
+    float humidity = dht.readHumidity();
+    float temperature = dht.readTemperature();
+
+    // Check if any reads failed
+    if (isnan(humidity) || isnan(temperature)) {
+      Serial.println("Failed to read from DHT sensor!");
+      return;
+    }
+
+    // Create JSON Payload
+    StaticJsonDocument<200> doc;
+    doc["device_id"] = "ESP32_Node_01";
+    doc["temperature_c"] = temperature;
+    doc["humidity"] = humidity;
+    doc["status"] = "active";
+
+    char jsonBuffer[512];
+    serializeJson(doc, jsonBuffer);
+
+    // Publish Data
+    Serial.print("Publishing message: ");
+    Serial.println(jsonBuffer);
+    client.publish(mqtt_topic, jsonBuffer);
+  }
+  
+  // The loop ends here instantly. Other non-blocking tasks can be added below.
+}
